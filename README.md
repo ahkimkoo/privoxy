@@ -99,3 +99,17 @@ another-one.net
       ```
 
 The proxy server will start, load the configuration, load custom domains, update the Gfwlist if necessary, and begin listening for connections.
+
+## Building from Source
+
+You can also build and package the application for different platforms using the provided build script.
+
+```bash
+# Make the script executable
+chmod +x build.sh
+
+# Run the script
+./build.sh
+```
+
+This will create a `release` directory containing `.zip` packages for Linux, Windows, and macOS. Each package includes the executable and the default configuration files.
