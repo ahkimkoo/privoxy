@@ -103,8 +103,16 @@ func loadGfwlistFromFile() error {
 
 // updateGfwlist downloads the latest GFW list and saves it locally.
 func updateGfwlist() {
-	log.Println("Downloading new GFW list...")
-	resp, err := http.Get(gfwlistURL)
+	log.Println("Downloading new GFW list via SOCKS5 proxy...")
+
+	// Create a new HTTP client that uses the SOCKS5 proxy
+	proxyClient := &http.Client{
+		Transport: &http.Transport{
+			Dial: socks5Dialer.Dial,
+		},
+	}
+
+	resp, err := proxyClient.Get(gfwlistURL)
 	if err != nil {
 		log.Printf("Failed to fetch GFW list: %v", err)
 		return

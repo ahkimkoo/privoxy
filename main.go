@@ -7,9 +7,21 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
+)
+
+var (
+	directTransport http.RoundTripper
+	proxyTransport  http.RoundTripper
+	socks5Dialer    proxy.Dialer
+	bufferPool      = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 32*1024)
+		},
+	}
 )
 
 func main() {
@@ -22,16 +34,42 @@ func main() {
 	flag.IntVar(&config.UpdateFrequencyHours, "update-hours", config.UpdateFrequencyHours, "GFWList update frequency in hours")
 	flag.Parse()
 
+	// Initialize transports and dialer
+	var err error
+	socks5Dialer, err = proxy.SOCKS5("tcp", config.Socks5Addr, nil, proxy.Direct)
+	if err != nil {
+		log.Fatalf("Failed to create SOCKS5 dialer: %v", err)
+	}
+
+	directTransport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	proxyTransport = &http.Transport{
+		Dial:                  socks5Dialer.Dial,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	loadCustomDomains()
 	startGfwlistUpdater()
 
 	log.Printf("Starting proxy server on %s", config.ListenAddr)
 	log.Printf("Using SOCKS5 proxy: %s", config.Socks5Addr)
 	server := &http.Server{
-		Addr:         config.ListenAddr,
-		Handler:      http.HandlerFunc(handleRequest),
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Addr:    config.ListenAddr,
+		Handler: http.HandlerFunc(handleRequest),
 	}
 	log.Fatal(server.ListenAndServe())
 }
@@ -39,12 +77,12 @@ func main() {
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	host := r.URL.Hostname()
 	if host == "" {
-		// For CONNECT requests, host is in r.Host
 		host = strings.Split(r.Host, ":")[0]
 	}
 
 	blocked := isBlocked(host)
-	log.Printf("Request for %s, host: %s, blocked: %v", r.URL.String(), host, blocked)
+	// Reduced logging for performance
+	// log.Printf("Request for %s, host: %s, blocked: %v", r.URL.String(), host, blocked)
 
 	if r.Method == http.MethodConnect {
 		handleHTTPS(w, r, blocked)
@@ -54,24 +92,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleHTTP(w http.ResponseWriter, r *http.Request, blocked bool) {
-	// Create a new request to avoid modifying the original
-	outReq := new(http.Request)
-	*outReq = *r
-
-	// Set up the transport
-	transport := &http.Transport{}
+	transport := directTransport
 	if blocked {
-		dialer, err := proxy.SOCKS5("tcp", config.Socks5Addr, nil, proxy.Direct)
-		if err != nil {
-			log.Printf("Failed to create SOCKS5 dialer: %v", err)
-			http.Error(w, "Server Error", http.StatusInternalServerError)
-			return
-		}
-		transport.Dial = dialer.Dial
+		transport = proxyTransport
 	}
 
-	// Execute the request
-	resp, err := transport.RoundTrip(outReq)
+	resp, err := transport.RoundTrip(r)
 	if err != nil {
 		log.Printf("Failed to get response: %v", err)
 		http.Error(w, "Server Error", http.StatusInternalServerError)
@@ -79,15 +105,12 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, blocked bool) {
 	}
 	defer resp.Body.Close()
 
-	// Copy headers and status code
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-
-	// Copy body
 	io.Copy(w, resp.Body)
 }
 
@@ -96,13 +119,7 @@ func handleHTTPS(w http.ResponseWriter, r *http.Request, blocked bool) {
 	var err error
 
 	if blocked {
-		dialer, err := proxy.SOCKS5("tcp", config.Socks5Addr, nil, proxy.Direct)
-		if err != nil {
-			log.Printf("Failed to create SOCKS5 dialer: %v", err)
-			http.Error(w, "Server Error", http.StatusInternalServerError)
-			return
-		}
-		destConn, err = dialer.Dial("tcp", r.Host)
+		destConn, err = socks5Dialer.Dial("tcp", r.Host)
 	} else {
 		destConn, err = net.Dial("tcp", r.Host)
 	}
@@ -126,12 +143,33 @@ func handleHTTPS(w http.ResponseWriter, r *http.Request, blocked bool) {
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
 		log.Printf("Failed to hijack connection: %v", err)
-		http.Error(w, "Server Error", http.StatusInternalServerError)
 		return
 	}
-	defer clientConn.Close()
 
-	// Tunnel the data
-	go io.Copy(destConn, clientConn)
-	io.Copy(clientConn, destConn)
+	tunnelData(clientConn, destConn)
+}
+
+// tunnelData uses io.CopyBuffer with a buffer pool to improve performance.
+func tunnelData(client, target net.Conn) {
+	defer client.Close()
+	defer target.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		buf := bufferPool.Get().([]byte)
+		defer bufferPool.Put(buf)
+		io.CopyBuffer(target, client, buf)
+	}()
+
+	go func() {
+		defer wg.Done()
+		buf := bufferPool.Get().([]byte)
+		defer bufferPool.Put(buf)
+		io.CopyBuffer(client, target, buf)
+	}()
+
+	wg.Wait()
 }
